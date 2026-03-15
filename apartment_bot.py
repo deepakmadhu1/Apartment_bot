@@ -42,7 +42,6 @@ log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # GitHub Gist persistence
-# Replaces all local file reads/writes — Gist is the permanent database.
 # ---------------------------------------------------------------------------
 
 _GIST_HEADERS = {
@@ -50,17 +49,16 @@ _GIST_HEADERS = {
     "Accept": "application/vnd.github+json",
 }
 
-_gist_cache: dict = {}   # in-memory cache so we only fetch the Gist once per run
+_gist_cache: dict = {}
 
 
 def _fetch_gist() -> dict:
-    """Fetch the full Gist and cache it. Returns dict of filename -> content."""
     global _gist_cache
     if _gist_cache:
         return _gist_cache
 
     if not GIST_TOKEN or not GIST_ID:
-        log.warning("GIST_TOKEN or GIST_ID not set — falling back to local files.")
+        log.warning("GIST_TOKEN or GIST_ID not set.")
         return {}
 
     try:
@@ -83,10 +81,6 @@ def _fetch_gist() -> dict:
 
 
 def _push_gist(files: dict):
-    """
-    Push updated files to the Gist.
-    files = { "filename.json": "content string", ... }
-    """
     if not GIST_TOKEN or not GIST_ID:
         return
 
@@ -107,11 +101,8 @@ def _push_gist(files: dict):
 
 
 def _gist_read(filename: str, default: str = "") -> str:
-    """Read a single file from the Gist."""
     return _fetch_gist().get(filename, default)
 
-
-# ------ seen listings -------------------------------------------------------
 
 def load_seen() -> set:
     raw = _gist_read("seen_listings.json", "[]")
@@ -124,8 +115,6 @@ def load_seen() -> set:
 def save_seen(seen: set):
     _push_gist({"seen_listings.json": json.dumps(sorted(list(seen)), indent=2)})
 
-
-# ------ subscribers ---------------------------------------------------------
 
 def load_subscribers() -> set:
     raw = _gist_read("subscribers.json", "[]")
@@ -140,8 +129,6 @@ def save_subscribers(subscribers: set):
     _push_gist({"subscribers.json": json.dumps(sorted(list(subscribers)), indent=2)})
 
 
-# ------ telegram offset -----------------------------------------------------
-
 def load_offset():
     raw = _gist_read("telegram_offset.txt", "").strip()
     try:
@@ -154,9 +141,6 @@ def save_offset(offset: int):
     _push_gist({"telegram_offset.txt": str(offset)})
 
 
-# ------ contact messages ----------------------------------------------------
-# Stored as a single JSON object in the Gist: { safe_id: message, ... }
-
 def _load_contact_messages() -> dict:
     raw = _gist_read("contact_messages.json", "{}")
     try:
@@ -168,7 +152,6 @@ def _load_contact_messages() -> dict:
 def _save_contact_message(safe_id: str, message: str):
     all_msgs = _load_contact_messages()
     all_msgs[safe_id] = message
-    # Keep only the most recent 200 to avoid the file growing forever
     if len(all_msgs) > 200:
         keys = list(all_msgs.keys())
         all_msgs = {k: all_msgs[k] for k in keys[-200:]}
@@ -202,6 +185,7 @@ def send_telegram_message(chat_id, message, reply_markup=None):
         payload["reply_markup"] = json.dumps(reply_markup)
     response = requests.post(url, data=payload, timeout=30)
     response.raise_for_status()
+
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -244,8 +228,9 @@ def is_good_listing(item, source=""):
         patterns += _KLEINANZ_RE
     return not any(p.search(title) for p in patterns)
 
+
 # ---------------------------------------------------------------------------
-# Gemini AI summary (free tier)
+# Gemini AI summary — gemini-2.0-flash (free tier)
 # ---------------------------------------------------------------------------
 
 def get_listing_summary(title: str, link: str, source: str) -> dict | None:
@@ -284,6 +269,7 @@ def get_listing_summary(title: str, link: str, source: str) -> dict | None:
         log.warning(f"Gemini summary failed for '{title}': {e}")
         return None
 
+
 # ---------------------------------------------------------------------------
 # Telegram message formatting
 # ---------------------------------------------------------------------------
@@ -314,6 +300,7 @@ def build_listing_message(item: dict, label: str = "New apartment found in Emden
         }
 
     return text, reply_markup
+
 
 # ---------------------------------------------------------------------------
 # Telegram inline button callback handling
@@ -347,9 +334,15 @@ def handle_callback_queries(results: list):
             except Exception as e:
                 log.warning(f"Failed to send contact message to {chat_id}: {e}")
 
+
 # ---------------------------------------------------------------------------
 # Scraping — WG-Gesucht (Playwright)
+# Fixed: only grab real listing links, skip nav/filter garbage
 # ---------------------------------------------------------------------------
+
+# WG-Gesucht listing URLs always contain a numeric ID like /12345.html
+_WG_LISTING_RE = re.compile(r"-in-Emden\.\d+\.\d+\.html")
+
 
 def get_wggesucht_listings():
     listings = []
@@ -377,23 +370,32 @@ def get_wggesucht_listings():
             with open("debug_wg.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
 
-        links = page.locator("a[href*='-in-Emden.'][href*='.html']")
-        count = links.count()
-        log.info(f"WG-Gesucht Emden links found: {count}")
+        # Grab ALL links then filter strictly in Python
+        all_links = page.locator("a[href]")
+        count     = all_links.count()
+        log.info(f"WG-Gesucht total links on page: {count}")
 
-        for i in range(min(count, 100)):
+        for i in range(min(count, 300)):
             try:
-                a         = links.nth(i)
-                href      = a.get_attribute("href")
-                title     = " ".join(a.inner_text().strip().split())
+                a         = all_links.nth(i)
+                href      = a.get_attribute("href") or ""
                 full_link = normalize_link(WG_URL, href)
 
-                if not full_link or not title or "-in-Emden." not in full_link:
+                # Must match real listing URL pattern: -in-Emden.DIGITS.DIGITS.html
+                if not full_link or not _WG_LISTING_RE.search(full_link):
+                    continue
+
+                title = " ".join(a.inner_text().strip().split())
+
+                # Skip blank, too-short, or pure-number titles (nav links)
+                if not title or len(title) < 10 or title.isdigit():
                     continue
 
                 listings.append({
-                    "id": f"wg::{full_link}", "title": title,
-                    "link": full_link, "source": "WG-Gesucht",
+                    "id":     f"wg::{full_link}",
+                    "title":  title,
+                    "link":   full_link,
+                    "source": "WG-Gesucht",
                 })
             except Exception:
                 continue
@@ -405,7 +407,10 @@ def get_wggesucht_listings():
         if item["id"] not in seen_ids and is_good_listing(item, "WG-Gesucht"):
             unique.append(item)
             seen_ids.add(item["id"])
+
+    log.info(f"WG-Gesucht listings after filtering: {len(unique)}")
     return unique
+
 
 # ---------------------------------------------------------------------------
 # Scraping — Kleinanzeigen (requests + BeautifulSoup)
@@ -431,12 +436,18 @@ def get_kleinanzeigen_listings():
         full_link = normalize_link(KLEINANZEIGEN_URL, href)
         if not full_link:
             continue
+
         title = " ".join(a.get_text(" ", strip=True).split())
-        if not title:
+
+        # Skip blank or too-short titles
+        if not title or len(title) < 5:
             continue
+
         listings.append({
-            "id": f"ka::{full_link}", "title": title,
-            "link": full_link, "source": "Kleinanzeigen",
+            "id":     f"ka::{full_link}",
+            "title":  title,
+            "link":   full_link,
+            "source": "Kleinanzeigen",
         })
 
     unique, seen_ids = [], set()
@@ -444,7 +455,10 @@ def get_kleinanzeigen_listings():
         if item["id"] not in seen_ids and is_good_listing(item, "Kleinanzeigen"):
             unique.append(item)
             seen_ids.add(item["id"])
+
+    log.info(f"Kleinanzeigen listings after filtering: {len(unique)}")
     return unique
+
 
 # ---------------------------------------------------------------------------
 # Aggregate
@@ -455,14 +469,12 @@ def get_all_listings():
 
     try:
         wg = get_wggesucht_listings()
-        log.info(f"WG-Gesucht listings: {len(wg)}")
         all_listings.extend(wg)
     except Exception as e:
         log.error(f"WG-Gesucht failed: {e}")
 
     try:
         ka = get_kleinanzeigen_listings()
-        log.info(f"Kleinanzeigen listings: {len(ka)}")
         all_listings.extend(ka)
     except Exception as e:
         log.error(f"Kleinanzeigen failed: {e}")
@@ -472,7 +484,9 @@ def get_all_listings():
         if item["id"] not in seen_ids:
             unique.append(item)
             seen_ids.add(item["id"])
+
     return unique
+
 
 # ---------------------------------------------------------------------------
 # Subscriber management
@@ -571,6 +585,7 @@ def send_listing_to_all(subscribers, listing):
             log.info(f"Sent to {chat_id}: {listing['title']}")
         except Exception as e:
             log.warning(f"Failed to send to {chat_id}: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Main
