@@ -19,14 +19,23 @@ GOOGLE_API_KEY     = os.environ.get("GOOGLE_API_KEY", "")
 GIST_TOKEN         = os.environ.get("GIST_TOKEN", "")
 GIST_ID            = os.environ.get("GIST_ID", "")
 
+# German search URLs for better results
 WG_URL = (
-    "https://www.wg-gesucht.de/1-zimmer-wohnungen-und-wohnungen-und-haeuser-in-Emden.32.1+2+3.1.0.html"
-    "?offer_filter=1&city_id=32&sort_order=0&noDeact=1"
-    "&categories%5B%5D=1&categories%5B%5D=2&categories%5B%5D=3"
+    "https://www.wg-gesucht.de/wohnungen-in-Emden.32.2.1.0.html"
+    "?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=2"
 )
+WG_URL_1ZIMMER = (
+    "https://www.wg-gesucht.de/1-zimmer-wohnungen-in-Emden.32.1.1.0.html"
+    "?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=1"
+)
+WG_URL_HAUS = (
+    "https://www.wg-gesucht.de/haeuser-in-Emden.32.3.1.0.html"
+    "?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=3"
+)
+
+# Kleinanzeigen — search "Wohnung mieten Emden"
 KLEINANZEIGEN_URL = (
-    "https://www.kleinanzeigen.de/s-wohnung-mieten/26721/wohnung-in-emden/"
-    "k0c203l3107+options:wohnung_mieten.built_in_kitchen_b"
+    "https://www.kleinanzeigen.de/s-wohnung-mieten/emden/k0c203l3107"
 )
 
 LOCK_FILE = "bot.lock"
@@ -57,11 +66,9 @@ def _fetch_gist() -> dict:
     global _gist_cache
     if _gist_cache:
         return _gist_cache
-
     if not GIST_TOKEN or not GIST_ID:
         log.warning("GIST_TOKEN or GIST_ID not set.")
         return {}
-
     try:
         r = requests.get(
             f"https://api.github.com/gists/{GIST_ID}",
@@ -84,7 +91,6 @@ def _fetch_gist() -> dict:
 def _push_gist(files: dict):
     if not GIST_TOKEN or not GIST_ID:
         return
-
     payload = {"files": {name: {"content": content} for name, content in files.items()}}
     try:
         r = requests.patch(
@@ -207,6 +213,7 @@ _BAD_WORDS_COMMON = [
     r"\bumzug\b", r"\btransport\b", r"\bgesuch\b",
     r"\bsucht\b", r"\bsuche\b", r"\btausch\b",
     r"wohnung gesucht", r"zimmer in wg", r"\bwg-zimmer\b",
+    r"\bvermietet\b",  # already rented — skip
 ]
 
 _BAD_WORDS_KLEINANZEIGEN_EXTRA = [
@@ -231,15 +238,102 @@ def is_good_listing(item, source=""):
 
 
 # ---------------------------------------------------------------------------
-# Gemini AI summary — gemini-2.0-flash (free tier)
-# 4 second delay between calls to stay under 15 requests/minute limit
+# Detail scraping — fetch price, size, rooms from listing page
 # ---------------------------------------------------------------------------
 
-def get_listing_summary(title: str, link: str, source: str) -> dict | None:
+def scrape_kleinanzeigen_details(url: str) -> dict:
+    """Scrape price, size, rooms from a Kleinanzeigen listing page."""
+    details = {"price": None, "size": None, "rooms": None}
+    try:
+        headers  = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Price — look for € symbol near a number
+        price_tag = soup.find(attrs={"data-testid": "price-amount"})
+        if not price_tag:
+            price_tag = soup.find(class_=re.compile(r"price", re.I))
+        if price_tag:
+            price_text = price_tag.get_text(" ", strip=True)
+            price_match = re.search(r"[\d.,]+\s*€|€\s*[\d.,]+", price_text)
+            if price_match:
+                details["price"] = price_match.group(0).strip()
+
+        # Size and rooms from detail attributes
+        for tag in soup.find_all(class_=re.compile(r"addetail|attribute|detail", re.I)):
+            text = tag.get_text(" ", strip=True)
+            if not details["size"]:
+                size_match = re.search(r"(\d+[\.,]?\d*)\s*m²", text)
+                if size_match:
+                    details["size"] = f"{size_match.group(1)} m²"
+            if not details["rooms"]:
+                room_match = re.search(r"(\d+[\.,]?\d*)\s*Zimmer", text, re.I)
+                if room_match:
+                    details["rooms"] = f"{room_match.group(1)} Zimmer"
+
+        # Fallback: search entire page text
+        full_text = soup.get_text(" ")
+        if not details["price"]:
+            price_match = re.search(r"(\d{2,4})\s*€\s*/?\s*(?:Monat|mtl|kalt|warm)?", full_text)
+            if price_match:
+                details["price"] = f"{price_match.group(1)} €"
+        if not details["size"]:
+            size_match = re.search(r"(\d+[\.,]?\d*)\s*m²", full_text)
+            if size_match:
+                details["size"] = f"{size_match.group(1)} m²"
+        if not details["rooms"]:
+            room_match = re.search(r"(\d+[\.,]?\d*)\s*Zimmer", full_text, re.I)
+            if room_match:
+                details["rooms"] = f"{room_match.group(1)} Zimmer"
+
+    except Exception as e:
+        log.debug(f"Detail scrape failed for {url}: {e}")
+
+    return details
+
+
+def scrape_wg_details(url: str, page) -> dict:
+    """Extract price, size, rooms from already-loaded WG-Gesucht page content."""
+    details = {"price": None, "size": None, "rooms": None}
+    try:
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        full_text = soup.get_text(" ")
+
+        price_match = re.search(r"(\d{2,4})\s*€", full_text)
+        if price_match:
+            details["price"] = f"{price_match.group(1)} €"
+
+        size_match = re.search(r"(\d+[\.,]?\d*)\s*m²", full_text)
+        if size_match:
+            details["size"] = f"{size_match.group(1)} m²"
+
+        room_match = re.search(r"(\d+[\.,]?\d*)\s*Zimmer", full_text, re.I)
+        if room_match:
+            details["rooms"] = f"{room_match.group(1)} Zimmer"
+
+    except Exception as e:
+        log.debug(f"WG detail parse failed: {e}")
+
+    return details
+
+
+# ---------------------------------------------------------------------------
+# Gemini AI summary — gemini-2.0-flash (free tier)
+# Includes price/size/rooms in prompt for richer summary
+# 4 second delay to stay under 15 req/min free limit
+# ---------------------------------------------------------------------------
+
+def get_listing_summary(title: str, link: str, source: str, details: dict) -> dict | None:
     if not GOOGLE_API_KEY:
         return None
 
-    time.sleep(4)  # stay under Gemini free tier limit of 15 req/min
+    time.sleep(4)  # stay under Gemini free tier rate limit
+
+    price = details.get("price") or "unknown"
+    size  = details.get("size")  or "unknown"
+    rooms = details.get("rooms") or "unknown"
 
     try:
         prompt = (
@@ -247,12 +341,16 @@ def get_listing_summary(title: str, link: str, source: str) -> dict | None:
             f"Listing details:\n"
             f"- Source: {source}\n"
             f"- Title: {title}\n"
+            f"- Price: {price}\n"
+            f"- Size: {size}\n"
+            f"- Rooms: {rooms}\n"
             f"- Link: {link}\n\n"
             f"Respond ONLY with a valid JSON object (no markdown, no extra text) "
             f"with exactly these two keys:\n"
-            f"1. \"summary\": A 1-2 sentence summary of what this listing likely offers.\n"
-            f"2. \"contact_message\": A short polite message in German (3-5 sentences) "
-            f"to send to the landlord to express interest and ask for a viewing.\n\n"
+            f"1. \"summary\": A 2-3 sentence summary IN ENGLISH describing what this listing offers, "
+            f"including price, size and rooms if known. Be specific and helpful.\n"
+            f"2. \"contact_message\": A short polite message IN GERMAN (3-5 sentences) "
+            f"to send to the landlord expressing interest and asking for a viewing appointment.\n\n"
             f"Example: {{\"summary\": \"...\", \"contact_message\": \"...\"}}"
         )
 
@@ -278,8 +376,19 @@ def get_listing_summary(title: str, link: str, source: str) -> dict | None:
 # Telegram message formatting
 # ---------------------------------------------------------------------------
 
-def build_listing_message(item: dict, label: str = "New apartment found in Emden"):
-    ai = get_listing_summary(item["title"], item["link"], item["source"])
+def build_listing_message(item: dict, label: str = "🆕 New Apartment Found in Emden"):
+    details = item.get("details", {})
+    ai      = get_listing_summary(item["title"], item["link"], item["source"], details)
+
+    # Build detail line from scraped data
+    detail_parts = []
+    if details.get("rooms"):
+        detail_parts.append(f"🛏 {details['rooms']}")
+    if details.get("size"):
+        detail_parts.append(f"📐 {details['size']}")
+    if details.get("price"):
+        detail_parts.append(f"💶 {details['price']}")
+    detail_line = "  |  ".join(detail_parts) if detail_parts else "Details not available"
 
     summary_line = ""
     if ai and ai.get("summary"):
@@ -288,7 +397,8 @@ def build_listing_message(item: dict, label: str = "New apartment found in Emden
     text = (
         f"🏠 <b>{label}</b>\n\n"
         f"🔎 <b>Source:</b> {item.get('source', 'Unknown')}\n"
-        f"📌 <b>Title:</b> {item['title']}"
+        f"📌 <b>Title:</b> {item['title']}\n"
+        f"{detail_line}"
         f"{summary_line}\n"
         f"🔗 <b>Link:</b> {item['link']}"
     )
@@ -341,89 +451,106 @@ def handle_callback_queries(results: list):
 
 # ---------------------------------------------------------------------------
 # Scraping — WG-Gesucht (Playwright)
-# Uses flexible regex to match real listing URLs, skips nav/filter links
+# Scrapes all 3 category URLs: Wohnungen, 1-Zimmer, Häuser
 # ---------------------------------------------------------------------------
 
-# Real WG-Gesucht listing URLs contain -in-Emden. followed by digits
 _WG_LISTING_RE = re.compile(r"-in-Emden\.")
 
 
-def get_wggesucht_listings():
+def _scrape_wg_url(page, url: str) -> list:
+    """Scrape one WG-Gesucht URL and return raw listing dicts."""
     listings = []
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page    = browser.new_page()
-        page.goto(WG_URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
-
+        # Dismiss cookie banner
         for selector in [
-            "text=Accept", "text=I agree", "text=Agree", "text=Accept all",
-            "button:has-text('Accept')", "button:has-text('Agree')",
+            "button:has-text('Alle akzeptieren')",
+            "button:has-text('Akzeptieren')",
+            "button:has-text('Accept')",
+            "button:has-text('Agree')",
+            "text=Accept all",
         ]:
             try:
                 loc = page.locator(selector)
                 if loc.count() > 0:
                     loc.first.click(timeout=2000)
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1000)
                     break
             except Exception:
                 pass
 
         if DEBUG:
-            with open("debug_wg.html", "w", encoding="utf-8") as f:
+            fname = url.split("/")[-1].split("?")[0]
+            with open(f"debug_wg_{fname}.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
 
         all_links = page.locator("a[href]")
         count     = all_links.count()
-        log.info(f"WG-Gesucht total links on page: {count}")
 
         for i in range(min(count, 300)):
             try:
                 a         = all_links.nth(i)
                 href      = a.get_attribute("href") or ""
-                full_link = normalize_link(WG_URL, href)
+                full_link = normalize_link(url, href)
 
-                # Must match -in-Emden. pattern
                 if not full_link or not _WG_LISTING_RE.search(full_link):
                     continue
-
-                # Must have a numeric ID in the URL path (real listings have this)
                 if not re.search(r"/\d+", full_link):
                     continue
 
                 title = " ".join(a.inner_text().strip().split())
-
-                # Skip blank, too-short, or pure-number titles (nav/filter links)
                 if not title or len(title) < 10 or title.isdigit():
                     continue
 
                 listings.append({
-                    "id":     f"wg::{full_link}",
-                    "title":  title,
-                    "link":   full_link,
-                    "source": "WG-Gesucht",
+                    "id":      f"wg::{full_link}",
+                    "title":   title,
+                    "link":    full_link,
+                    "source":  "WG-Gesucht",
+                    "details": {},
                 })
             except Exception:
                 continue
 
+    except Exception as e:
+        log.error(f"Failed to scrape WG URL {url}: {e}")
+
+    return listings
+
+
+def get_wggesucht_listings() -> list:
+    all_listings = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page    = browser.new_page()
+
+        for url in [WG_URL, WG_URL_1ZIMMER, WG_URL_HAUS]:
+            results = _scrape_wg_url(page, url)
+            log.info(f"WG-Gesucht scraped {len(results)} from {url.split('?')[0]}")
+            all_listings.extend(results)
+
         browser.close()
 
+    # Deduplicate and filter
     unique, seen_ids = [], set()
-    for item in listings:
+    for item in all_listings:
         if item["id"] not in seen_ids and is_good_listing(item, "WG-Gesucht"):
             unique.append(item)
             seen_ids.add(item["id"])
 
-    log.info(f"WG-Gesucht listings after filtering: {len(unique)}")
+    log.info(f"WG-Gesucht listings after dedup+filter: {len(unique)}")
     return unique
 
 
 # ---------------------------------------------------------------------------
 # Scraping — Kleinanzeigen (requests + BeautifulSoup)
+# Also fetches each listing page to get price/size/rooms
 # ---------------------------------------------------------------------------
 
-def get_kleinanzeigen_listings():
+def get_kleinanzeigen_listings() -> list:
     headers  = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(KLEINANZEIGEN_URL, headers=headers, timeout=30)
     response.raise_for_status()
@@ -445,32 +572,45 @@ def get_kleinanzeigen_listings():
             continue
 
         title = " ".join(a.get_text(" ", strip=True).split())
-
         if not title or len(title) < 5:
             continue
 
         listings.append({
-            "id":     f"ka::{full_link}",
-            "title":  title,
-            "link":   full_link,
-            "source": "Kleinanzeigen",
+            "id":      f"ka::{full_link}",
+            "title":   title,
+            "link":    full_link,
+            "source":  "Kleinanzeigen",
+            "details": {},
         })
 
+    # Deduplicate and filter first
     unique, seen_ids = [], set()
     for item in listings:
         if item["id"] not in seen_ids and is_good_listing(item, "Kleinanzeigen"):
             unique.append(item)
             seen_ids.add(item["id"])
 
+    # Now scrape details for each unique listing
+    log.info(f"Kleinanzeigen: scraping details for {len(unique)} listings...")
+    for item in unique:
+        try:
+            item["details"] = scrape_kleinanzeigen_details(item["link"])
+            time.sleep(1)  # be polite to the server
+        except Exception as e:
+            log.debug(f"Could not get details for {item['title']}: {e}")
+
     log.info(f"Kleinanzeigen listings after filtering: {len(unique)}")
     return unique
 
 
 # ---------------------------------------------------------------------------
-# Aggregate
+# Aggregate — newest first ordering
+# WG-Gesucht returns newest first by default (sort_order=0)
+# Kleinanzeigen also returns newest first by default
+# So we just keep source order, WG first then Kleinanzeigen
 # ---------------------------------------------------------------------------
 
-def get_all_listings():
+def get_all_listings() -> list:
     all_listings = []
 
     try:
@@ -491,6 +631,7 @@ def get_all_listings():
             unique.append(item)
             seen_ids.add(item["id"])
 
+    log.info(f"Total unique listings: {len(unique)}")
     return unique
 
 
@@ -540,7 +681,10 @@ def update_subscribers_from_telegram():
             if chat_id_str in subscribers:
                 subscribers.remove(chat_id_str)
                 try:
-                    send_telegram_message(chat_id_str, "You have been unsubscribed from apartment alerts.")
+                    send_telegram_message(
+                        chat_id_str,
+                        "✅ You have been unsubscribed from Emden apartment alerts."
+                    )
                 except Exception:
                     pass
                 log.info(f"Removed subscriber: {chat_id_str}")
@@ -559,20 +703,23 @@ def update_subscribers_from_telegram():
 
 
 def send_current_listings_to_new_user(chat_id, listings, limit=10):
+    # Send newest first — listings are already in newest-first order
     latest = listings[:limit]
     if not latest:
         send_telegram_message(
             chat_id,
-            "You are subscribed to Emden apartment alerts.\n\nNo listings found right now."
+            "✅ You are subscribed to Emden apartment alerts.\n\nNo listings found right now."
         )
         return
 
     send_telegram_message(
         chat_id,
-        f"✅ You are now subscribed to Emden apartment alerts.\n\nHere are the latest {len(latest)} listings:"
+        f"✅ <b>You are now subscribed to Emden apartment alerts!</b>\n\n"
+        f"Here are the latest <b>{len(latest)}</b> listings, newest first:"
     )
+
     for item in latest:
-        text, markup = build_listing_message(item, label="Current apartment in Emden")
+        text, markup = build_listing_message(item, label="🏠 Current Apartment in Emden")
         try:
             send_telegram_message(chat_id, text, reply_markup=markup)
         except Exception as e:
