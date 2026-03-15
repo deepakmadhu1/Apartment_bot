@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 import logging
 import requests
 from bs4 import BeautifulSoup
@@ -231,11 +232,14 @@ def is_good_listing(item, source=""):
 
 # ---------------------------------------------------------------------------
 # Gemini AI summary — gemini-2.0-flash (free tier)
+# 4 second delay between calls to stay under 15 requests/minute limit
 # ---------------------------------------------------------------------------
 
 def get_listing_summary(title: str, link: str, source: str) -> dict | None:
     if not GOOGLE_API_KEY:
         return None
+
+    time.sleep(4)  # stay under Gemini free tier limit of 15 req/min
 
     try:
         prompt = (
@@ -337,11 +341,11 @@ def handle_callback_queries(results: list):
 
 # ---------------------------------------------------------------------------
 # Scraping — WG-Gesucht (Playwright)
-# Fixed: only grab real listing links, skip nav/filter garbage
+# Uses flexible regex to match real listing URLs, skips nav/filter links
 # ---------------------------------------------------------------------------
 
-# WG-Gesucht listing URLs always contain a numeric ID like /12345.html
-_WG_LISTING_RE = re.compile(r"-in-Emden\.\d+\.\d+\.html")
+# Real WG-Gesucht listing URLs contain -in-Emden. followed by digits
+_WG_LISTING_RE = re.compile(r"-in-Emden\.")
 
 
 def get_wggesucht_listings():
@@ -370,7 +374,6 @@ def get_wggesucht_listings():
             with open("debug_wg.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
 
-        # Grab ALL links then filter strictly in Python
         all_links = page.locator("a[href]")
         count     = all_links.count()
         log.info(f"WG-Gesucht total links on page: {count}")
@@ -381,13 +384,17 @@ def get_wggesucht_listings():
                 href      = a.get_attribute("href") or ""
                 full_link = normalize_link(WG_URL, href)
 
-                # Must match real listing URL pattern: -in-Emden.DIGITS.DIGITS.html
+                # Must match -in-Emden. pattern
                 if not full_link or not _WG_LISTING_RE.search(full_link):
+                    continue
+
+                # Must have a numeric ID in the URL path (real listings have this)
+                if not re.search(r"/\d+", full_link):
                     continue
 
                 title = " ".join(a.inner_text().strip().split())
 
-                # Skip blank, too-short, or pure-number titles (nav links)
+                # Skip blank, too-short, or pure-number titles (nav/filter links)
                 if not title or len(title) < 10 or title.isdigit():
                     continue
 
@@ -439,7 +446,6 @@ def get_kleinanzeigen_listings():
 
         title = " ".join(a.get_text(" ", strip=True).split())
 
-        # Skip blank or too-short titles
         if not title or len(title) < 5:
             continue
 
