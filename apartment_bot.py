@@ -269,7 +269,7 @@ def get_listing_summary(title: str, link: str, source: str) -> dict | None:
 
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}",
+            f"gemini-2.0-flash:generateContent?key={GOOGLE_API_KEY}",
             headers={"Content-Type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=20,
@@ -377,7 +377,7 @@ def get_wggesucht_listings():
             with open("debug_wg.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
 
-        links = page.locator("a[href*='-in-Emden.']")
+        links = page.locator("a[href*='-in-Emden.'][href*='.html']")
         count = links.count()
         log.info(f"WG-Gesucht Emden links found: {count}")
 
