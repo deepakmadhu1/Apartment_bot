@@ -6,7 +6,6 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 from filelock import FileLock
-from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
 # Config
@@ -21,11 +20,15 @@ GIST_ID            = os.environ.get("GIST_ID", "")
 
 WG_BASE = "https://www.wg-gesucht.de"
 
-WG_URLS = {
-    "WG-Zimmer":        f"{WG_BASE}/wg-zimmer-in-Emden.32.0.1.0.html?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=0",
-    "1-Zimmer-Wohnung": f"{WG_BASE}/1-zimmer-wohnungen-in-Emden.32.1.1.0.html?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=1",
-    "Wohnung":          f"{WG_BASE}/wohnungen-in-Emden.32.2.1.0.html?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=2",
-    "Haus":             f"{WG_BASE}/haeuser-in-Emden.32.3.1.0.html?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D=3",
+# WG-Gesucht internal API — returns JSON listings directly, no Playwright needed
+# city_id=32 = Emden
+# category: 0=WG-Zimmer, 1=1-Zimmer, 2=Wohnung, 3=Haus
+WG_API_URL = "https://www.wg-gesucht.de/api/v1/ads"
+WG_CATEGORIES = {
+    0: "WG-Zimmer",
+    1: "1-Zimmer-Wohnung",
+    2: "Wohnung",
+    3: "Haus",
 }
 
 KLEINANZEIGEN_WOHNUNG_URL = "https://www.kleinanzeigen.de/s-wohnung-mieten/emden/k0c203l3107"
@@ -202,8 +205,7 @@ _BAD_WORDS_COMMON = [
     r"\bsucht\b", r"\bsuche\b", r"\btausch\b",
     r"wohnung gesucht", r"\bvermietet\b",
 ]
-
-_BAD_WORDS_KLEINANZEIGEN_EXTRA = [
+_BAD_WORDS_KA_EXTRA = [
     r"\bverkauf\b", r"\bzu verkaufen\b", r"\bkaufen\b",
 ]
 
@@ -212,15 +214,15 @@ def _compile_patterns(patterns):
     return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
-_COMMON_RE   = _compile_patterns(_BAD_WORDS_COMMON)
-_KLEINANZ_RE = _compile_patterns(_BAD_WORDS_KLEINANZEIGEN_EXTRA)
+_COMMON_RE = _compile_patterns(_BAD_WORDS_COMMON)
+_KA_RE     = _compile_patterns(_BAD_WORDS_KA_EXTRA)
 
 
 def is_good_listing(item, source=""):
     title    = item.get("title", "")
     patterns = _COMMON_RE[:]
     if source == "Kleinanzeigen":
-        patterns += _KLEINANZ_RE
+        patterns += _KA_RE
     return not any(p.search(title) for p in patterns)
 
 
@@ -234,7 +236,160 @@ def property_emoji(category: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Detail scraping — Kleinanzeigen
+# WG-Gesucht — JSON API (no Playwright, no bot detection)
+# ---------------------------------------------------------------------------
+
+def get_wggesucht_listings() -> list:
+    """
+    Fetches listings from WG-Gesucht's internal API.
+    Falls back to HTML scraping with requests if API fails.
+    """
+    all_listings = []
+    headers = {
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":       "application/json, text/plain, */*",
+        "Referer":      "https://www.wg-gesucht.de/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    for cat_id, cat_name in WG_CATEGORIES.items():
+        try:
+            params = {
+                "city_id":      32,        # Emden
+                "category":     cat_id,
+                "rent_type":    0,         # all rent types
+                "noDeact":      1,
+                "offer_filter": 1,
+                "sort_order":   0,         # newest first
+                "page_size":    30,
+            }
+            r = requests.get(
+                WG_API_URL,
+                params=params,
+                headers=headers,
+                timeout=20,
+            )
+
+            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
+                data  = r.json()
+                ads   = data.get("_embedded", {}).get("ads", []) or data.get("ads", [])
+                log.info(f"WG-Gesucht API [{cat_name}]: {len(ads)} ads")
+
+                for ad in ads:
+                    ad_id    = ad.get("id") or ad.get("ad_id", "")
+                    title    = ad.get("title") or ad.get("headline", "")
+                    url_path = ad.get("url") or f"/wg-zimmer-und-1-zimmer-wohnungen-und-wohnungen-und-haeuser-in-Emden.32.{cat_id}.{ad_id}.html"
+                    full_url = WG_BASE + url_path if url_path.startswith("/") else url_path
+
+                    price = None
+                    rent  = ad.get("rent") or ad.get("costs", {}).get("rent_including_utilities_costs")
+                    if rent:
+                        price = f"{rent} €/Monat"
+
+                    size  = None
+                    sqm   = ad.get("size") or ad.get("living_size")
+                    if sqm:
+                        size = f"{sqm} m²"
+
+                    rooms = None
+                    rm    = ad.get("wg_size") or ad.get("number_of_rooms")
+                    if rm:
+                        rooms = f"{rm} Zimmer"
+
+                    if not title or not ad_id:
+                        continue
+
+                    all_listings.append({
+                        "id":       f"wg::{full_url}",
+                        "title":    title.strip(),
+                        "link":     full_url,
+                        "source":   "WG-Gesucht",
+                        "category": cat_name,
+                        "details":  {"price": price, "size": size, "rooms": rooms},
+                    })
+            else:
+                # API didn't return JSON — fall back to HTML scraping
+                log.warning(f"WG-Gesucht API [{cat_name}] returned {r.status_code}, trying HTML fallback")
+                fallback = _wg_html_fallback(cat_id, cat_name, headers)
+                all_listings.extend(fallback)
+
+        except Exception as e:
+            log.error(f"WG-Gesucht [{cat_name}] failed: {e}")
+
+    # Deduplicate and filter
+    unique, seen_ids = [], set()
+    for item in all_listings:
+        if item["id"] not in seen_ids and is_good_listing(item, "WG-Gesucht"):
+            unique.append(item)
+            seen_ids.add(item["id"])
+
+    log.info(f"WG-Gesucht total after dedup+filter: {len(unique)}")
+    return unique
+
+
+def _wg_html_fallback(cat_id: int, cat_name: str, headers: dict) -> list:
+    """HTML scrape fallback using requests (no Playwright)."""
+    listings = []
+    cat_slug = {
+        0: "wg-zimmer",
+        1: "1-zimmer-wohnungen",
+        2: "wohnungen",
+        3: "haeuser",
+    }.get(cat_id, "wohnungen")
+
+    url = (
+        f"{WG_BASE}/{cat_slug}-in-Emden.32.{cat_id}.1.0.html"
+        f"?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D={cat_id}"
+    )
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Match real listing URLs: /xxx-in-Emden.32.CAT_ID.LISTING_ID.html
+        pattern = re.compile(
+            rf"/{cat_slug}-in-Emden\.32\.{cat_id}\.(\d{{5,}})\.html",
+            re.IGNORECASE,
+        )
+
+        seen_hrefs = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"].split("?")[0]
+            m    = pattern.match(href)
+            if not m or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+
+            full_link = WG_BASE + href
+            title     = " ".join(a.get_text(" ", strip=True).split())
+            if not title or len(title) < 5:
+                parent = a.find_parent()
+                if parent:
+                    title = " ".join(parent.get_text(" ", strip=True).split())[:120]
+            if not title or len(title) < 5:
+                title = f"{cat_name} in Emden"
+
+            listings.append({
+                "id":       f"wg::{full_link}",
+                "title":    title,
+                "link":     full_link,
+                "source":   "WG-Gesucht",
+                "category": cat_name,
+                "details":  {},
+            })
+
+        log.info(f"WG-Gesucht HTML fallback [{cat_name}]: {len(listings)} listings")
+
+    except Exception as e:
+        log.error(f"WG-Gesucht HTML fallback [{cat_name}] failed: {e}")
+
+    return listings
+
+
+# ---------------------------------------------------------------------------
+# Kleinanzeigen — requests + BeautifulSoup
 # ---------------------------------------------------------------------------
 
 def scrape_kleinanzeigen_details(url: str) -> dict:
@@ -243,8 +398,7 @@ def scrape_kleinanzeigen_details(url: str) -> dict:
         headers  = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        soup      = BeautifulSoup(response.text, "html.parser")
-        full_text = soup.get_text(" ")
+        full_text = BeautifulSoup(response.text, "html.parser").get_text(" ")
 
         price_match = re.search(r"(\d{2,4}(?:[.,]\d{1,2})?)\s*€", full_text)
         if price_match:
@@ -261,6 +415,91 @@ def scrape_kleinanzeigen_details(url: str) -> dict:
     except Exception as e:
         log.debug(f"Detail scrape failed for {url}: {e}")
     return details
+
+
+def _scrape_kleinanzeigen_url(url: str, category: str) -> list:
+    listings = []
+    try:
+        headers  = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        soup  = BeautifulSoup(response.text, "html.parser")
+        links = soup.select("a[href*='/s-anzeige/']")
+        log.info(f"Kleinanzeigen [{category}]: {len(links)} raw links")
+
+        for a in links:
+            full_link = normalize_link(url, a.get("href"))
+            if not full_link:
+                continue
+            title = " ".join(a.get_text(" ", strip=True).split())
+            if not title or len(title) < 5:
+                continue
+            listings.append({
+                "id":       f"ka::{full_link}",
+                "title":    title,
+                "link":     full_link,
+                "source":   "Kleinanzeigen",
+                "category": category,
+                "details":  {},
+            })
+    except Exception as e:
+        log.error(f"Kleinanzeigen scrape failed for {url}: {e}")
+    return listings
+
+
+def get_kleinanzeigen_listings() -> list:
+    all_listings = []
+    for url, category in [
+        (KLEINANZEIGEN_WOHNUNG_URL, "Wohnung"),
+        (KLEINANZEIGEN_WG_URL,      "WG-Zimmer"),
+    ]:
+        all_listings.extend(_scrape_kleinanzeigen_url(url, category))
+
+    unique, seen_ids = [], set()
+    for item in all_listings:
+        if item["id"] not in seen_ids and is_good_listing(item, "Kleinanzeigen"):
+            unique.append(item)
+            seen_ids.add(item["id"])
+
+    log.info(f"Kleinanzeigen: scraping details for {len(unique)} listings...")
+    for item in unique:
+        try:
+            item["details"] = scrape_kleinanzeigen_details(item["link"])
+            time.sleep(1)
+        except Exception as e:
+            log.debug(f"Details failed for {item['title']}: {e}")
+
+    log.info(f"Kleinanzeigen total: {len(unique)}")
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Aggregate
+# ---------------------------------------------------------------------------
+
+def get_all_listings() -> list:
+    all_listings = []
+
+    try:
+        wg = get_wggesucht_listings()
+        all_listings.extend(wg)
+    except Exception as e:
+        log.error(f"WG-Gesucht failed: {e}")
+
+    try:
+        ka = get_kleinanzeigen_listings()
+        all_listings.extend(ka)
+    except Exception as e:
+        log.error(f"Kleinanzeigen failed: {e}")
+
+    unique, seen_ids = [], set()
+    for item in all_listings:
+        if item["id"] not in seen_ids:
+            unique.append(item)
+            seen_ids.add(item["id"])
+
+    log.info(f"Total unique listings: {len(unique)}")
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +529,8 @@ def get_listing_summary(title: str, link: str, source: str, category: str, detai
             f"- Rooms: {rooms}\n"
             f"- Link: {link}\n\n"
             f"Respond ONLY with a valid JSON object with exactly these two keys:\n"
-            f"1. \"summary\": 2-3 sentences IN ENGLISH. Mention type "
-            f"({'shared room in a flat' if is_wg else 'apartment/house'}), "
+            f"1. \"summary\": 2-3 sentences IN ENGLISH describing the listing. "
+            f"Mention type ({'shared room in a flat' if is_wg else 'apartment/house'}), "
             f"price, size, rooms if known.\n"
             f"2. \"contact_message\": 3-5 sentences IN GERMAN to send to the landlord "
             f"expressing interest and requesting a viewing.\n\n"
@@ -396,212 +635,6 @@ def handle_callback_queries(results: list):
 
 
 # ---------------------------------------------------------------------------
-# Scraping — WG-Gesucht (Playwright)
-# Uses BeautifulSoup on the rendered HTML to find listing cards reliably
-# ---------------------------------------------------------------------------
-
-def _scrape_wg_url(page, url: str, category: str) -> list:
-    listings = []
-    try:
-        page.goto(url, wait_until="networkidle", timeout=90000)
-        page.wait_for_timeout(5000)
-
-        # Dismiss cookie banner
-        for selector in [
-            "button:has-text('Alle akzeptieren')",
-            "button:has-text('Akzeptieren')",
-            "button:has-text('Accept all')",
-            "button:has-text('Accept')",
-            "#cmpbntyestxt",
-        ]:
-            try:
-                loc = page.locator(selector)
-                if loc.count() > 0:
-                    loc.first.click(timeout=3000)
-                    page.wait_for_timeout(2000)
-                    break
-            except Exception:
-                pass
-
-        html = page.content()
-
-        # Always save HTML so we can inspect it in the logs
-        fname = category.replace(" ", "_").replace("-", "_")
-        with open(f"wg_{fname}.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        log.info(f"Saved wg_{fname}.html for inspection")
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # WG-Gesucht listing links follow the pattern:
-        # /wg-zimmer-in-Emden.32.0.1234567.html  (WG room)
-        # /wohnungen-in-Emden.32.2.1234567.html   (flat)
-        # etc. — always ends in a long numeric ID
-        listing_pattern = re.compile(
-            r"^/(?:wg-zimmer|1-zimmer-wohnungen|wohnungen|haeuser)-in-Emden\.\d+\.\d+\.\d+\.html$",
-            re.IGNORECASE
-        )
-
-        seen_hrefs = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].split("?")[0]  # strip query params
-            if not listing_pattern.match(href):
-                continue
-            if href in seen_hrefs:
-                continue
-            seen_hrefs.add(href)
-
-            full_link = WG_BASE + href
-            title     = " ".join(a.get_text(" ", strip=True).split())
-
-            if not title or len(title) < 5:
-                # Try parent element for title text
-                parent = a.find_parent()
-                if parent:
-                    title = " ".join(parent.get_text(" ", strip=True).split())[:120]
-
-            if not title or len(title) < 5:
-                title = href.split("/")[-1].replace(".html", "").replace("-", " ").title()
-
-            listings.append({
-                "id":       f"wg::{full_link}",
-                "title":    title,
-                "link":     full_link,
-                "source":   "WG-Gesucht",
-                "category": category,
-                "details":  {},
-            })
-
-        log.info(f"WG-Gesucht [{category}]: found {len(listings)} listings")
-
-    except Exception as e:
-        log.error(f"Failed to scrape WG URL {url}: {e}")
-
-    return listings
-
-
-def get_wggesucht_listings() -> list:
-    all_listings = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page    = browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-
-        for category, url in WG_URLS.items():
-            results = _scrape_wg_url(page, url, category)
-            all_listings.extend(results)
-
-        browser.close()
-
-    unique, seen_ids = [], set()
-    for item in all_listings:
-        if item["id"] not in seen_ids and is_good_listing(item, "WG-Gesucht"):
-            unique.append(item)
-            seen_ids.add(item["id"])
-
-    log.info(f"WG-Gesucht total after dedup+filter: {len(unique)}")
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# Scraping — Kleinanzeigen
-# ---------------------------------------------------------------------------
-
-def _scrape_kleinanzeigen_url(url: str, category: str) -> list:
-    listings = []
-    try:
-        headers  = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-
-        soup  = BeautifulSoup(response.text, "html.parser")
-        links = soup.select("a[href*='/s-anzeige/']")
-        log.info(f"Kleinanzeigen [{category}]: {len(links)} raw links")
-
-        for a in links:
-            href      = a.get("href")
-            full_link = normalize_link(url, href)
-            if not full_link:
-                continue
-            title = " ".join(a.get_text(" ", strip=True).split())
-            if not title or len(title) < 5:
-                continue
-            listings.append({
-                "id":       f"ka::{full_link}",
-                "title":    title,
-                "link":     full_link,
-                "source":   "Kleinanzeigen",
-                "category": category,
-                "details":  {},
-            })
-    except Exception as e:
-        log.error(f"Kleinanzeigen scrape failed for {url}: {e}")
-    return listings
-
-
-def get_kleinanzeigen_listings() -> list:
-    all_listings = []
-
-    for url, category in [
-        (KLEINANZEIGEN_WOHNUNG_URL, "Wohnung"),
-        (KLEINANZEIGEN_WG_URL,      "WG-Zimmer"),
-    ]:
-        results = _scrape_kleinanzeigen_url(url, category)
-        all_listings.extend(results)
-
-    # Deduplicate and filter
-    unique, seen_ids = [], set()
-    for item in all_listings:
-        if item["id"] not in seen_ids and is_good_listing(item, "Kleinanzeigen"):
-            unique.append(item)
-            seen_ids.add(item["id"])
-
-    # Scrape details for each listing
-    log.info(f"Kleinanzeigen: scraping details for {len(unique)} listings...")
-    for item in unique:
-        try:
-            item["details"] = scrape_kleinanzeigen_details(item["link"])
-            time.sleep(1)
-        except Exception as e:
-            log.debug(f"Could not get details for {item['title']}: {e}")
-
-    log.info(f"Kleinanzeigen total: {len(unique)}")
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# Aggregate
-# ---------------------------------------------------------------------------
-
-def get_all_listings() -> list:
-    all_listings = []
-
-    try:
-        wg = get_wggesucht_listings()
-        all_listings.extend(wg)
-    except Exception as e:
-        log.error(f"WG-Gesucht failed: {e}")
-
-    try:
-        ka = get_kleinanzeigen_listings()
-        all_listings.extend(ka)
-    except Exception as e:
-        log.error(f"Kleinanzeigen failed: {e}")
-
-    unique, seen_ids = [], set()
-    for item in all_listings:
-        if item["id"] not in seen_ids:
-            unique.append(item)
-            seen_ids.add(item["id"])
-
-    log.info(f"Total unique listings: {len(unique)}")
-    return unique
-
-
-# ---------------------------------------------------------------------------
 # Subscriber management
 # ---------------------------------------------------------------------------
 
@@ -683,7 +716,6 @@ def send_current_listings_to_new_user(chat_id, listings, limit=10):
         f"Sources: WG-Gesucht + Kleinanzeigen\n\n"
         f"Here are the latest <b>{len(latest)}</b> listings, newest first:"
     )
-
     for item in latest:
         text, markup = build_listing_message(item, label="🏠 Current Listing in Emden")
         try:
@@ -696,7 +728,6 @@ def send_listing_to_all(subscribers, listing):
     if not subscribers:
         log.info("No subscribers to notify.")
         return
-
     text, markup = build_listing_message(listing)
     for chat_id in subscribers:
         try:
