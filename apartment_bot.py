@@ -1,785 +1,340 @@
+"""Berlin apartment alerts: WG-Gesucht and Kleinanzeigen -> Telegram.
+
+Configuration is supplied through GitHub Actions environment/secrets.
+Persistence uses a GitHub Gist so scheduled runners can remember past listings.
+"""
+from __future__ import annotations
+
+import html
 import json
+import logging
 import os
 import re
 import time
-import logging
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from filelock import FileLock
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("berlin_apartment_bot")
 
-DEBUG = os.environ.get("DEBUG", "0") == "1"
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GOOGLE_API_KEY     = os.environ.get("GOOGLE_API_KEY", "")
-GIST_TOKEN         = os.environ.get("GIST_TOKEN", "")
-GIST_ID            = os.environ.get("GIST_ID", "")
-
+CITY = "Berlin"
+WG_CITY_ID = 8
 WG_BASE = "https://www.wg-gesucht.de"
-
-# WG-Gesucht internal API — returns JSON listings directly, no Playwright needed
-# city_id=32 = Emden
-# category: 0=WG-Zimmer, 1=1-Zimmer, 2=Wohnung, 3=Haus
-WG_API_URL = "https://www.wg-gesucht.de/api/v1/ads"
-WG_CATEGORIES = {
-    0: "WG-Zimmer",
-    1: "1-Zimmer-Wohnung",
-    2: "Wohnung",
-    3: "Haus",
+WG_API = WG_BASE + "/api/v1/ads"
+WG_CATEGORIES = {0: "WG-Zimmer", 1: "1-Zimmer-Wohnung", 2: "Wohnung", 3: "Haus"}
+KA_SEARCHES = {
+    "Wohnung": "https://www.kleinanzeigen.de/s-wohnung-mieten/berlin/k0c203l3331",
+    "WG-Zimmer": "https://www.kleinanzeigen.de/s-wg-zimmer/berlin/k0c220l3331",
 }
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GIST_TOKEN = os.getenv("GIST_TOKEN", "").strip()
+GIST_ID = os.getenv("GIST_ID", "").strip()
+MAX_RENT = int(os.getenv("MAX_RENT", "0"))
+MAX_PER_RUN = max(1, int(os.getenv("MAX_PER_RUN", "25")))
+INITIAL_SEND = os.getenv("INITIAL_SEND", "true").lower() == "true"
+ALLOWED_CHAT_IDS = {s.strip() for s in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if s.strip()}
+SEEN_FILE = "seen_listings_berlin.json"  # Do not reuse Emden's seen history
+SUBSCRIBERS_FILE = "subscribers.json"  # Preserve existing bot subscriptions
+OFFSET_FILE = "telegram_offset.txt"
 
-KLEINANZEIGEN_WOHNUNG_URL = "https://www.kleinanzeigen.de/s-wohnung-mieten/emden/k0c203l3107"
-KLEINANZEIGEN_WG_URL      = "https://www.kleinanzeigen.de/s-wg-zimmer/emden/k0c220l3107"
-
-LOCK_FILE = "bot.lock"
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.DEBUG if DEBUG else logging.INFO,
-)
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# GitHub Gist persistence
-# ---------------------------------------------------------------------------
-
-_GIST_HEADERS = {
-    "Authorization": f"token {GIST_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
-_gist_cache: dict = {}
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+})
 
 
-def _fetch_gist() -> dict:
-    global _gist_cache
-    if _gist_cache:
-        return _gist_cache
-    if not GIST_TOKEN or not GIST_ID:
-        log.warning("GIST_TOKEN or GIST_ID not set.")
-        return {}
+def get(url: str, *, params: dict | None = None) -> requests.Response:
+    response = HTTP.get(url, params=params, timeout=25)
+    response.raise_for_status()
+    return response
+
+
+def gist_load() -> dict[str, str] | None:
+    """None means unavailable; do not send alerts without reliable state."""
+    if not GIST_ID or not GIST_TOKEN:
+        log.error("GIST_ID and GIST_TOKEN are required for persistent deduplication")
+        return None
     try:
-        r = requests.get(
+        response = requests.get(
             f"https://api.github.com/gists/{GIST_ID}",
-            headers=_GIST_HEADERS, timeout=15,
+            headers={"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"},
+            timeout=25,
         )
-        r.raise_for_status()
-        data = r.json()
-        _gist_cache = {
-            name: file_data.get("content", "")
-            for name, file_data in data.get("files", {}).items()
-        }
-        log.info("Gist fetched successfully.")
-        return _gist_cache
-    except Exception as e:
-        log.error(f"Failed to fetch Gist: {e}")
-        return {}
-
-
-def _push_gist(files: dict):
-    if not GIST_TOKEN or not GIST_ID:
-        return
-    payload = {"files": {name: {"content": content} for name, content in files.items()}}
-    try:
-        r = requests.patch(
-            f"https://api.github.com/gists/{GIST_ID}",
-            headers=_GIST_HEADERS, json=payload, timeout=15,
-        )
-        r.raise_for_status()
-        global _gist_cache
-        _gist_cache = {}
-        log.info(f"Gist updated: {list(files.keys())}")
-    except Exception as e:
-        log.error(f"Failed to update Gist: {e}")
-
-
-def _gist_read(filename: str, default: str = "") -> str:
-    return _fetch_gist().get(filename, default)
-
-
-def load_seen() -> set:
-    raw = _gist_read("seen_listings.json", "[]")
-    try:
-        return set(json.loads(raw))
-    except Exception:
-        return set()
-
-
-def save_seen(seen: set):
-    _push_gist({"seen_listings.json": json.dumps(sorted(list(seen)), indent=2)})
-
-
-def load_subscribers() -> set:
-    raw = _gist_read("subscribers.json", "[]")
-    try:
-        return set(str(x) for x in json.loads(raw))
-    except Exception:
-        return set()
-
-
-def save_subscribers(subscribers: set):
-    _push_gist({"subscribers.json": json.dumps(sorted(list(subscribers)), indent=2)})
-
-
-def load_offset():
-    raw = _gist_read("telegram_offset.txt", "").strip()
-    try:
-        return int(raw) if raw else None
-    except Exception:
+        response.raise_for_status()
+        return {name: file.get("content", "") for name, file in response.json().get("files", {}).items()}
+    except (requests.RequestException, ValueError) as exc:
+        log.error("Gist read failed: %s", exc)
         return None
 
 
-def save_offset(offset: int):
-    _push_gist({"telegram_offset.txt": str(offset)})
-
-
-def _load_contact_messages() -> dict:
-    raw = _gist_read("contact_messages.json", "{}")
+def gist_save(changes: dict[str, str]) -> bool:
     try:
-        return json.loads(raw)
-    except Exception:
-        return {}
+        response = requests.patch(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"},
+            json={"files": {name: {"content": value} for name, value in changes.items()}},
+            timeout=25,
+        )
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        log.error("Gist write failed: %s", exc)
+        return False
 
 
-def _save_contact_message(safe_id: str, message: str):
-    all_msgs = _load_contact_messages()
-    all_msgs[safe_id] = message
-    if len(all_msgs) > 200:
-        keys = list(all_msgs.keys())
-        all_msgs = {k: all_msgs[k] for k in keys[-200:]}
-    _push_gist({"contact_messages.json": json.dumps(all_msgs, indent=2, ensure_ascii=False)})
+def json_state(files: dict[str, str], filename: str, default: Any) -> Any:
+    try:
+        return json.loads(files.get(filename, json.dumps(default)))
+    except (ValueError, TypeError):
+        log.warning("Invalid %s; using default", filename)
+        return default
 
 
-def _load_contact_message(safe_id: str):
-    return _load_contact_messages().get(safe_id)
-
-
-# ---------------------------------------------------------------------------
-# Telegram helpers
-# ---------------------------------------------------------------------------
-
-def telegram_api(method, params=None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    response = requests.get(url, params=params, timeout=30)
+def telegram(method: str, **params: Any) -> dict:
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+    response = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=params, timeout=25)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram {method} returned an error")
+    return data
 
 
-def send_telegram_message(chat_id, message, reply_markup=None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True,
-        "parse_mode": "HTML",
-    }
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    response = requests.post(url, data=payload, timeout=30)
-    response.raise_for_status()
+def send(chat_id: str, text: str, reply_markup: dict | None = None) -> bool:
+    try:
+        args: dict[str, Any] = {"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
+        if reply_markup:
+            args["reply_markup"] = reply_markup
+        telegram("sendMessage", **args)
+        return True
+    except (requests.RequestException, ValueError, RuntimeError) as exc:
+        log.error("Telegram delivery to %s failed: %s", chat_id, exc)
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def normalize_link(base_url, href):
-    if not href:
+def normalize_price(value: Any) -> int | None:
+    if isinstance(value, dict):
+        for key in ("amount", "value", "rent_including_utilities_costs", "rent", "price"):
+            if key in value:
+                return normalize_price(value[key])
         return None
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("/"):
-        domain = "/".join(base_url.split("/")[:3])
-        return domain + href
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        match = re.search(r"\d[\d.,]*", value)
+        if match:
+            cleaned = match.group().replace(".", "").split(",")[0]
+            try:
+                return int(cleaned)
+            except ValueError:
+                return None
     return None
 
 
-_BAD_WORDS_COMMON = [
-    r"\bumzug\b", r"\btransport\b", r"\bgesuch\b",
-    r"\bsucht\b", r"\bsuche\b", r"\btausch\b",
-    r"wohnung gesucht", r"\bvermietet\b",
-]
-_BAD_WORDS_KA_EXTRA = [
-    r"\bverkauf\b", r"\bzu verkaufen\b", r"\bkaufen\b",
-]
+def accepted(title: str, rent: int | None) -> bool:
+    if re.search(r"\b(gesuch(?:t)?|suche|suche(n)?\s+wohnung|wohnungstausch|tauschwohnung|verkauf|zu verkaufen|vermietet)\b", title, re.I):
+        return False
+    return not (MAX_RENT > 0 and rent is not None and rent > MAX_RENT)
 
 
-def _compile_patterns(patterns):
-    return [re.compile(p, re.IGNORECASE) for p in patterns]
-
-
-_COMMON_RE = _compile_patterns(_BAD_WORDS_COMMON)
-_KA_RE     = _compile_patterns(_BAD_WORDS_KA_EXTRA)
-
-
-def is_good_listing(item, source=""):
-    title    = item.get("title", "")
-    patterns = _COMMON_RE[:]
-    if source == "Kleinanzeigen":
-        patterns += _KA_RE
-    return not any(p.search(title) for p in patterns)
-
-
-def property_emoji(category: str) -> str:
-    return {
-        "WG-Zimmer":        "🛋",
-        "1-Zimmer-Wohnung": "🏢",
-        "Wohnung":          "🏠",
-        "Haus":             "🏡",
-    }.get(category, "🏠")
-
-
-# ---------------------------------------------------------------------------
-# WG-Gesucht — JSON API (no Playwright, no bot detection)
-# ---------------------------------------------------------------------------
-
-def get_wggesucht_listings() -> list:
-    """
-    Fetches listings from WG-Gesucht's internal API.
-    Falls back to HTML scraping with requests if API fails.
-    """
-    all_listings = []
-    headers = {
-        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept":       "application/json, text/plain, */*",
-        "Referer":      "https://www.wg-gesucht.de/",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    for cat_id, cat_name in WG_CATEGORIES.items():
-        try:
-            params = {
-                "city_id":      32,        # Emden
-                "category":     cat_id,
-                "rent_type":    0,         # all rent types
-                "noDeact":      1,
-                "offer_filter": 1,
-                "sort_order":   0,         # newest first
-                "page_size":    30,
-            }
-            r = requests.get(
-                WG_API_URL,
-                params=params,
-                headers=headers,
-                timeout=20,
-            )
-
-            if r.status_code == 200 and "application/json" in r.headers.get("Content-Type", ""):
-                data  = r.json()
-                ads   = data.get("_embedded", {}).get("ads", []) or data.get("ads", [])
-                log.info(f"WG-Gesucht API [{cat_name}]: {len(ads)} ads")
-
-                for ad in ads:
-                    ad_id    = ad.get("id") or ad.get("ad_id", "")
-                    title    = ad.get("title") or ad.get("headline", "")
-                    url_path = ad.get("url") or f"/wg-zimmer-und-1-zimmer-wohnungen-und-wohnungen-und-haeuser-in-Emden.32.{cat_id}.{ad_id}.html"
-                    full_url = WG_BASE + url_path if url_path.startswith("/") else url_path
-
-                    price = None
-                    rent  = ad.get("rent") or ad.get("costs", {}).get("rent_including_utilities_costs")
-                    if rent:
-                        price = f"{rent} €/Monat"
-
-                    size  = None
-                    sqm   = ad.get("size") or ad.get("living_size")
-                    if sqm:
-                        size = f"{sqm} m²"
-
-                    rooms = None
-                    rm    = ad.get("wg_size") or ad.get("number_of_rooms")
-                    if rm:
-                        rooms = f"{rm} Zimmer"
-
-                    if not title or not ad_id:
-                        continue
-
-                    all_listings.append({
-                        "id":       f"wg::{full_url}",
-                        "title":    title.strip(),
-                        "link":     full_url,
-                        "source":   "WG-Gesucht",
-                        "category": cat_name,
-                        "details":  {"price": price, "size": size, "rooms": rooms},
-                    })
-            else:
-                # API didn't return JSON — fall back to HTML scraping
-                log.warning(f"WG-Gesucht API [{cat_name}] returned {r.status_code}, trying HTML fallback")
-                fallback = _wg_html_fallback(cat_id, cat_name, headers)
-                all_listings.extend(fallback)
-
-        except Exception as e:
-            log.error(f"WG-Gesucht [{cat_name}] failed: {e}")
-
-    # Deduplicate and filter
-    unique, seen_ids = [], set()
-    for item in all_listings:
-        if item["id"] not in seen_ids and is_good_listing(item, "WG-Gesucht"):
-            unique.append(item)
-            seen_ids.add(item["id"])
-
-    log.info(f"WG-Gesucht total after dedup+filter: {len(unique)}")
-    return unique
-
-
-def _wg_html_fallback(cat_id: int, cat_name: str, headers: dict) -> list:
-    """HTML scrape fallback using requests (no Playwright)."""
-    listings = []
-    cat_slug = {
-        0: "wg-zimmer",
-        1: "1-zimmer-wohnungen",
-        2: "wohnungen",
-        3: "haeuser",
-    }.get(cat_id, "wohnungen")
-
-    url = (
-        f"{WG_BASE}/{cat_slug}-in-Emden.32.{cat_id}.1.0.html"
-        f"?offer_filter=1&city_id=32&sort_order=0&noDeact=1&categories%5B%5D={cat_id}"
-    )
-
-    try:
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Match real listing URLs: /xxx-in-Emden.32.CAT_ID.LISTING_ID.html
-        pattern = re.compile(
-            rf"/{cat_slug}-in-Emden\.32\.{cat_id}\.(\d{{5,}})\.html",
-            re.IGNORECASE,
-        )
-
-        seen_hrefs = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].split("?")[0]
-            m    = pattern.match(href)
-            if not m or href in seen_hrefs:
-                continue
-            seen_hrefs.add(href)
-
-            full_link = WG_BASE + href
-            title     = " ".join(a.get_text(" ", strip=True).split())
-            if not title or len(title) < 5:
-                parent = a.find_parent()
-                if parent:
-                    title = " ".join(parent.get_text(" ", strip=True).split())[:120]
-            if not title or len(title) < 5:
-                title = f"{cat_name} in Emden"
-
-            listings.append({
-                "id":       f"wg::{full_link}",
-                "title":    title,
-                "link":     full_link,
-                "source":   "WG-Gesucht",
-                "category": cat_name,
-                "details":  {},
-            })
-
-        log.info(f"WG-Gesucht HTML fallback [{cat_name}]: {len(listings)} listings")
-
-    except Exception as e:
-        log.error(f"WG-Gesucht HTML fallback [{cat_name}] failed: {e}")
-
-    return listings
-
-
-# ---------------------------------------------------------------------------
-# Kleinanzeigen — requests + BeautifulSoup
-# ---------------------------------------------------------------------------
-
-def scrape_kleinanzeigen_details(url: str) -> dict:
-    details = {"price": None, "size": None, "rooms": None}
-    try:
-        headers  = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        full_text = BeautifulSoup(response.text, "html.parser").get_text(" ")
-
-        price_match = re.search(r"(\d{2,4}(?:[.,]\d{1,2})?)\s*€", full_text)
-        if price_match:
-            details["price"] = f"{price_match.group(1)} €/Monat"
-
-        size_match = re.search(r"(\d+[\.,]?\d*)\s*m²", full_text)
-        if size_match:
-            details["size"] = f"{size_match.group(1)} m²"
-
-        room_match = re.search(r"(\d+[\.,]?\d*)\s*Zimmer", full_text, re.I)
-        if room_match:
-            details["rooms"] = f"{room_match.group(1)} Zimmer"
-
-    except Exception as e:
-        log.debug(f"Detail scrape failed for {url}: {e}")
-    return details
-
-
-def _scrape_kleinanzeigen_url(url: str, category: str) -> list:
-    listings = []
-    try:
-        headers  = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        soup  = BeautifulSoup(response.text, "html.parser")
-        links = soup.select("a[href*='/s-anzeige/']")
-        log.info(f"Kleinanzeigen [{category}]: {len(links)} raw links")
-
-        for a in links:
-            full_link = normalize_link(url, a.get("href"))
-            if not full_link:
-                continue
-            title = " ".join(a.get_text(" ", strip=True).split())
-            if not title or len(title) < 5:
-                continue
-            listings.append({
-                "id":       f"ka::{full_link}",
-                "title":    title,
-                "link":     full_link,
-                "source":   "Kleinanzeigen",
-                "category": category,
-                "details":  {},
-            })
-    except Exception as e:
-        log.error(f"Kleinanzeigen scrape failed for {url}: {e}")
-    return listings
-
-
-def get_kleinanzeigen_listings() -> list:
-    all_listings = []
-    for url, category in [
-        (KLEINANZEIGEN_WOHNUNG_URL, "Wohnung"),
-        (KLEINANZEIGEN_WG_URL,      "WG-Zimmer"),
-    ]:
-        all_listings.extend(_scrape_kleinanzeigen_url(url, category))
-
-    unique, seen_ids = [], set()
-    for item in all_listings:
-        if item["id"] not in seen_ids and is_good_listing(item, "Kleinanzeigen"):
-            unique.append(item)
-            seen_ids.add(item["id"])
-
-    log.info(f"Kleinanzeigen: scraping details for {len(unique)} listings...")
-    for item in unique:
-        try:
-            item["details"] = scrape_kleinanzeigen_details(item["link"])
-            time.sleep(1)
-        except Exception as e:
-            log.debug(f"Details failed for {item['title']}: {e}")
-
-    log.info(f"Kleinanzeigen total: {len(unique)}")
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# Aggregate
-# ---------------------------------------------------------------------------
-
-def get_all_listings() -> list:
-    all_listings = []
-
-    try:
-        wg = get_wggesucht_listings()
-        all_listings.extend(wg)
-    except Exception as e:
-        log.error(f"WG-Gesucht failed: {e}")
-
-    try:
-        ka = get_kleinanzeigen_listings()
-        all_listings.extend(ka)
-    except Exception as e:
-        log.error(f"Kleinanzeigen failed: {e}")
-
-    unique, seen_ids = [], set()
-    for item in all_listings:
-        if item["id"] not in seen_ids:
-            unique.append(item)
-            seen_ids.add(item["id"])
-
-    log.info(f"Total unique listings: {len(unique)}")
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# Gemini AI summary
-# ---------------------------------------------------------------------------
-
-def get_listing_summary(title: str, link: str, source: str, category: str, details: dict) -> dict | None:
-    if not GOOGLE_API_KEY:
+def entry(source: str, category: str, title: str, url: str, price: Any = None, area: str = "") -> dict | None:
+    title = " ".join(str(title).split())[:200]
+    rent = normalize_price(price)
+    if not url.startswith("https://") or not accepted(title, rent):
         return None
+    return {"id": f"{source}:{url.split('?')[0]}", "source": source, "category": category,
+            "title": title or category, "link": url, "rent": rent, "area": str(area)[:100]}
 
-    time.sleep(4)
 
-    price = details.get("price") or "not listed"
-    size  = details.get("size")  or "not listed"
-    rooms = details.get("rooms") or "not listed"
-    is_wg = category == "WG-Zimmer"
+def wg_api_listings() -> tuple[list[dict], bool]:
+    """WG's internal endpoint is unofficial; fallback to HTML on failure."""
+    results: list[dict] = []
+    working = False
+    for category, category_name in WG_CATEGORIES.items():
+        try:
+            response = get(WG_API, params={
+                "city_id": WG_CITY_ID, "category": category, "rent_type": 0,
+                "sort_order": 0, "limit": 50, "noDeact": 1,
+            })
+            payload = response.json()
+            ads = payload if isinstance(payload, list) else payload.get("ads", payload.get("data", []))
+            if isinstance(ads, dict):
+                ads = ads.get("ads", ads.get("items", []))
+            if not isinstance(ads, list):
+                raise ValueError("Unexpected API response")
+            working = True
+            for ad in ads:
+                if not isinstance(ad, dict):
+                    continue
+                listing_id = ad.get("id") or ad.get("ad_id")
+                url = str(ad.get("url") or "")
+                if not url and listing_id:
+                    url = f"{WG_BASE}/{listing_id}.html"
+                url = urljoin(WG_BASE, url)
+                costs = ad.get("costs") or {}
+                rent = ad.get("rent") or (costs.get("rent_including_utilities_costs") if isinstance(costs, dict) else None)
+                item = entry("WG-Gesucht", category_name, ad.get("title") or ad.get("headline") or category_name,
+                             url, rent, ad.get("district") or "")
+                if item:
+                    results.append(item)
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            log.warning("WG API (%s) unavailable: %s", category_name, exc)
+    return results, working
 
+
+def wg_html_listings() -> list[dict]:
+    results: list[dict] = []
+    slugs = {0: "wg-zimmer", 1: "1-zimmer-wohnungen", 2: "wohnungen", 3: "haeuser"}
+    for category, label in WG_CATEGORIES.items():
+        url = f"{WG_BASE}/{slugs[category]}-in-Berlin.8.{category}.1.0.html"
+        try:
+            page = BeautifulSoup(get(url, params={"city_id": WG_CITY_ID, "noDeact": 1}).text, "html.parser")
+            for a in page.select("a[href]"):
+                href = a.get("href", "")
+                match = re.search(r"(?:\.8\.\d+\.)?(\d{6,})\.html", href)
+                if not match or "berlin" not in (href + " " + a.get_text(" ", strip=True)).lower() and ".8." not in href:
+                    continue
+                link = f"{WG_BASE}/{match.group(1)}.html"
+                title = a.get("title") or a.get_text(" ", strip=True) or label
+                parent = a.find_parent("article") or a.find_parent("div", class_=re.compile("card|offer|listing", re.I))
+                details = parent.get_text(" ", strip=True) if parent else ""
+                price_match = re.search(r"(\d[\d.,]*)\s*€", details)
+                item = entry("WG-Gesucht", label, title, link, price_match.group(1) if price_match else None)
+                if item:
+                    results.append(item)
+        except requests.RequestException as exc:
+            log.warning("WG HTML (%s) failed: %s", label, exc)
+    return results
+
+
+def kleinanzeigen_listings() -> list[dict]:
+    results: list[dict] = []
+    for label, url in KA_SEARCHES.items():
+        try:
+            soup = BeautifulSoup(get(url).text, "html.parser")
+            for card in soup.select("article.aditem, article[data-adid]"):
+                a = card.select_one("a.ellipsis, a[href*='/s-anzeige/']")
+                if not a:
+                    continue
+                link = urljoin("https://www.kleinanzeigen.de", a.get("href", ""))
+                if urlparse(link).netloc != "www.kleinanzeigen.de" or "/s-anzeige/" not in link:
+                    continue
+                title = a.get_text(" ", strip=True) or card.get("data-adid", label)
+                price_tag = card.select_one(".aditem-main--middle--price-shipping--price")
+                price = price_tag.get_text(" ", strip=True) if price_tag else None
+                location_tag = card.select_one(".aditem-main--top--left")
+                area = location_tag.get_text(" ", strip=True) if location_tag else ""
+                item = entry("Kleinanzeigen", label, title, link, price, area)
+                if item:
+                    results.append(item)
+        except requests.RequestException as exc:
+            log.warning("Kleinanzeigen (%s) unavailable: %s", label, exc)
+    return results
+
+
+def all_listings() -> list[dict]:
+    wg, api_working = wg_api_listings()
+    if not api_working or not wg:
+        wg += wg_html_listings()
+    items = wg + kleinanzeigen_listings()
+    dedup: dict[str, dict] = {}
+    for item in items:
+        dedup[item["id"]] = item
+    log.info("Found %d unique Berlin listings", len(dedup))
+    return list(dedup.values())
+
+
+def listing_message(item: dict, heading: str = "New Berlin apartment listing") -> tuple[str, dict]:
+    emoji = {"WG-Zimmer": "🛋", "1-Zimmer-Wohnung": "🏢", "Wohnung": "🏠", "Haus": "🏡"}.get(item["category"], "🏠")
+    text = (f"{emoji} <b>{html.escape(heading)}</b>\n\n"
+            f"<b>{html.escape(item['title'])}</b>\n"
+            f"📍 Berlin {html.escape(item.get('area') or '')}\n"
+            f"💶 {item['rent']} €/month\n" if item.get("rent") is not None else
+            f"{emoji} <b>{html.escape(heading)}</b>\n\n<b>{html.escape(item['title'])}</b>\n📍 Berlin\n")
+    text += f"🏷 {html.escape(item['category'])} · {html.escape(item['source'])}\n"
+    return text, {"inline_keyboard": [[{"text": "View listing", "url": item["link"]}]]}
+
+
+def process_telegram_updates(files: dict[str, str], subscribers: set[str], listings: list[dict]) -> tuple[set[str], dict[str, str]]:
+    changes: dict[str, str] = {}
     try:
-        prompt = (
-            f"You are a helpful assistant for someone apartment hunting in Emden, Germany.\n\n"
-            f"Listing:\n"
-            f"- Type: {category}\n"
-            f"- Source: {source}\n"
-            f"- Title: {title}\n"
-            f"- Price: {price}\n"
-            f"- Size: {size}\n"
-            f"- Rooms: {rooms}\n"
-            f"- Link: {link}\n\n"
-            f"Respond ONLY with a valid JSON object with exactly these two keys:\n"
-            f"1. \"summary\": 2-3 sentences IN ENGLISH describing the listing. "
-            f"Mention type ({'shared room in a flat' if is_wg else 'apartment/house'}), "
-            f"price, size, rooms if known.\n"
-            f"2. \"contact_message\": 3-5 sentences IN GERMAN to send to the landlord "
-            f"expressing interest and requesting a viewing.\n\n"
-            f"Example: {{\"summary\": \"...\", \"contact_message\": \"...\"}}"
-        )
-
-        response = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GOOGLE_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=20,
-        )
-        response.raise_for_status()
-        data     = response.json()
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        clean    = raw_text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        return json.loads(clean)
-
-    except Exception as e:
-        log.warning(f"Gemini summary failed for '{title}': {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Telegram message formatting
-# ---------------------------------------------------------------------------
-
-def build_listing_message(item: dict, label: str = "🆕 New Listing Found in Emden"):
-    details  = item.get("details", {})
-    category = item.get("category", item.get("source", ""))
-    ai       = get_listing_summary(
-        item["title"], item["link"], item["source"], category, details
-    )
-
-    emoji = property_emoji(category)
-
-    detail_parts = []
-    if details.get("rooms"):
-        detail_parts.append(f"🛏 {details['rooms']}")
-    if details.get("size"):
-        detail_parts.append(f"📐 {details['size']}")
-    if details.get("price"):
-        detail_parts.append(f"💶 {details['price']}")
-    detail_line = "  |  ".join(detail_parts) if detail_parts else ""
-
-    summary_line = ""
-    if ai and ai.get("summary"):
-        summary_line = f"\n📝 <b>Summary:</b> {ai['summary']}"
-
-    text = (
-        f"{emoji} <b>{label}</b>\n\n"
-        f"🔎 <b>Source:</b> {item.get('source', 'Unknown')}\n"
-        f"🏷 <b>Type:</b> {category}\n"
-        f"📌 <b>Title:</b> {item['title']}\n"
-    )
-    if detail_line:
-        text += f"{detail_line}\n"
-    text += f"{summary_line}\n🔗 <b>Link:</b> {item['link']}"
-
-    reply_markup = None
-    if ai and ai.get("contact_message"):
-        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", item["id"])[:50]
-        _save_contact_message(safe_id, ai["contact_message"])
-        reply_markup = {
-            "inline_keyboard": [[
-                {"text": "✉️ Get message to send landlord", "callback_data": f"cm::{safe_id}"}
-            ]]
-        }
-
-    return text, reply_markup
-
-
-# ---------------------------------------------------------------------------
-# Telegram inline button callback handling
-# ---------------------------------------------------------------------------
-
-def handle_callback_queries(results: list):
-    for item in results:
-        cq = item.get("callback_query")
-        if not cq:
-            continue
-        callback_id = cq["id"]
-        chat_id     = cq["message"]["chat"]["id"]
-        data        = cq.get("data", "")
-        try:
-            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id})
-        except Exception:
-            pass
-        if data.startswith("cm::"):
-            safe_id = data[4:]
-            msg     = _load_contact_message(safe_id)
-            reply   = (
-                f"✉️ <b>Ready-to-send message (German):</b>\n\n{msg}"
-                if msg else
-                "Sorry, the contact message for this listing is no longer available."
-            )
-            try:
-                send_telegram_message(chat_id, reply)
-            except Exception as e:
-                log.warning(f"Failed to send contact message to {chat_id}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Subscriber management
-# ---------------------------------------------------------------------------
-
-def update_subscribers_from_telegram():
-    subscribers = load_subscribers()
-    newly_added = []
-    offset      = load_offset()
-
-    params = {"timeout": 0}
-    if offset is not None:
-        params["offset"] = offset
-
-    data = telegram_api("getUpdates", params=params)
-    if not data.get("ok"):
-        log.warning("Could not read Telegram updates.")
-        return subscribers, newly_added
-
-    results = data.get("result", [])
-    log.info(f"Telegram updates found: {len(results)}")
-    handle_callback_queries(results)
-
-    new_offset = offset
-    for item in results:
-        update_id = item.get("update_id")
-        if update_id is not None:
-            new_offset = update_id + 1
-
-        message = item.get("message") or item.get("edited_message")
-        if not message:
-            continue
-
-        chat        = message.get("chat", {})
-        chat_id     = chat.get("id")
-        text        = (message.get("text") or "").strip()
-
-        if chat_id is None or chat.get("type") != "private":
-            continue
-
-        chat_id_str = str(chat_id)
-
-        if text.lower() in ["/stop", "stop", "unsubscribe"]:
-            if chat_id_str in subscribers:
-                subscribers.remove(chat_id_str)
-                try:
-                    send_telegram_message(
-                        chat_id_str,
-                        "✅ You have been unsubscribed from Emden apartment alerts."
-                    )
-                except Exception:
-                    pass
-                log.info(f"Removed subscriber: {chat_id_str}")
-            continue
-
-        if chat_id_str not in subscribers:
-            subscribers.add(chat_id_str)
-            newly_added.append(chat_id_str)
-            log.info(f"Added subscriber: {chat_id_str}")
-
-    save_subscribers(subscribers)
-    if new_offset is not None:
-        save_offset(new_offset)
-
-    return subscribers, newly_added
-
-
-def send_current_listings_to_new_user(chat_id, listings, limit=10):
-    latest = listings[:limit]
-    if not latest:
-        send_telegram_message(
-            chat_id,
-            "✅ You are subscribed to Emden apartment alerts.\n\nNo listings found right now."
-        )
-        return
-
-    send_telegram_message(
-        chat_id,
-        f"✅ <b>You are now subscribed to Emden apartment alerts!</b>\n\n"
-        f"Searching: 🛋 WG-Zimmer  |  🏢 1-Zimmer  |  🏠 Wohnungen  |  🏡 Häuser\n"
-        f"Sources: WG-Gesucht + Kleinanzeigen\n\n"
-        f"Here are the latest <b>{len(latest)}</b> listings, newest first:"
-    )
-    for item in latest:
-        text, markup = build_listing_message(item, label="🏠 Current Listing in Emden")
-        try:
-            send_telegram_message(chat_id, text, reply_markup=markup)
-        except Exception as e:
-            log.warning(f"Failed to send listing to {chat_id}: {e}")
-
-
-def send_listing_to_all(subscribers, listing):
-    if not subscribers:
-        log.info("No subscribers to notify.")
-        return
-    text, markup = build_listing_message(listing)
-    for chat_id in subscribers:
-        try:
-            send_telegram_message(chat_id, text, reply_markup=markup)
-            log.info(f"Sent to {chat_id}: {listing['title']}")
-        except Exception as e:
-            log.warning(f"Failed to send to {chat_id}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    lock = FileLock(LOCK_FILE, timeout=0)
+        previous_offset = int(files.get(OFFSET_FILE, "0") or "0")
+    except ValueError:
+        previous_offset = 0
     try:
-        with lock:
-            _run()
-    except Exception:
-        log.warning("Another instance is already running. Exiting.")
+        response = telegram("getUpdates", offset=previous_offset, timeout=0, allowed_updates=["message"])
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        log.warning("Cannot read Telegram commands: %s", exc)
+        return subscribers, changes
+    highest = previous_offset
+    updated = False
+    for update in response.get("result", []):
+        highest = max(highest, update["update_id"] + 1)
+        msg = update.get("message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id", ""))
+        if not chat_id or (ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS):
+            continue
+        command = (msg.get("text") or "").split(" ")[0].split("@")[0].lower()
+        if command in ("/start", "/subscribe"):
+            first_time = chat_id not in subscribers
+            subscribers.add(chat_id)
+            updated = True
+            sent = send(chat_id, "✅ Subscribed to Berlin apartment alerts!\nSources: WG-Gesucht and Kleinanzeigen.\nUse /stop to unsubscribe.")
+            if sent and first_time and INITIAL_SEND:
+                for item in listings[:min(MAX_PER_RUN, 10)]:
+                    text, markup = listing_message(item, "Current Berlin listing")
+                    send(chat_id, text, markup)
+        elif command in ("/stop", "/unsubscribe"):
+            subscribers.discard(chat_id)
+            updated = True
+            send(chat_id, "✅ Unsubscribed from Berlin apartment alerts.")
+        elif command == "/help":
+            send(chat_id, "Berlin apartment bot\n/start — Subscribe\n/stop — Unsubscribe\n/help — Commands")
+    if highest > previous_offset:
+        changes[OFFSET_FILE] = str(highest)
+    if updated:
+        changes[SUBSCRIBERS_FILE] = json.dumps(sorted(subscribers))
+    return subscribers, changes
 
 
-def _run():
-    listings = get_all_listings()
-    log.info(f"Total listings scraped: {len(listings)}")
+def main() -> None:
+    if not TOKEN or not GIST_ID or not GIST_TOKEN:
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN, GIST_ID and GIST_TOKEN as GitHub Actions secrets")
+    files = gist_load()
+    if files is None:
+        raise RuntimeError("Cannot load persistent state; refusing to send duplicate notifications")
+    subscribers = {str(x) for x in json_state(files, SUBSCRIBERS_FILE, [])}
+    listings = all_listings()
+    subscribers, command_changes = process_telegram_updates(files, subscribers, listings)
 
-    subscribers, newly_added = update_subscribers_from_telegram()
-    log.info(f"Subscribers: {len(subscribers)} | New this run: {len(newly_added)}")
-
-    for chat_id in newly_added:
-        try:
-            send_current_listings_to_new_user(chat_id, listings, limit=10)
-        except Exception as e:
-            log.error(f"Failed initial send to {chat_id}: {e}")
-
-    seen         = load_seen()
-    new_listings = [item for item in listings if item["id"] not in seen]
-    log.info(f"Already seen: {len(seen)} | New: {len(new_listings)}")
-
-    if not new_listings:
-        log.info("No new listings found.")
-        return
-
-    for item in new_listings:
-        send_listing_to_all(subscribers, item)
-        seen.add(item["id"])
-
-    save_seen(seen)
+    # First run establishes a baseline (except /start snapshots). Subsequent runs alert new ads.
+    existing_seen = {str(x) for x in json_state(files, SEEN_FILE, [])}
+    is_first_run = SEEN_FILE not in files
+    newly_found = [item for item in listings if item["id"] not in existing_seen]
+    if is_first_run:
+        log.info("First Berlin run: creating baseline; no bulk alert for previous listings")
+    elif subscribers:
+        for item in newly_found[:MAX_PER_RUN]:
+            text, markup = listing_message(item)
+            for chat_id in sorted(subscribers):
+                send(chat_id, text, markup)
+            time.sleep(0.15)
+    else:
+        log.info("No Telegram subscribers. Send /start to your bot")
+    # Keep bounded history and preserve all seen IDs (including unalerted listings).
+    new_seen = sorted(existing_seen | {item["id"] for item in listings})
+    if len(new_seen) > 10000:
+        new_seen = new_seen[-10000:]
+    command_changes[SEEN_FILE] = json.dumps(new_seen, ensure_ascii=False)
+    if not gist_save(command_changes):
+        raise RuntimeError("Unable to persist updated seen-listing state")
+    log.info("Run finished; %d new listings, %d subscribers", len(newly_found), len(subscribers))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log.critical(f"Bot crashed: {e}", exc_info=True)
+    main()
