@@ -227,18 +227,65 @@ def is_good_listing(item, source=""):
 
 
 def rent_euros(price):
-    """Extract a monthly EUR amount from the existing listing details."""
+    """Parse complete EUR prices; never truncate 1400 or 1.400 to 400.
+
+    German prices: 1.400 €, 1.400,50 €, 1400 €, 599,50 €.
+    Also accepts 1,400 € when a comma is used as a thousands separator.
+    Unknown/ambiguous prices return None (and are excluded from alerts).
+    """
+    if isinstance(price, bool):
+        return None
     if isinstance(price, (int, float)):
-        return float(price)
+        return float(price) if price >= 0 else None
     if not price:
         return None
-    match = re.search(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*€", str(price))
+
+    text = str(price).replace("\u00a0", " ").replace("\u202f", " ")
+    match = re.search(
+        r"(?<![\d.,])(?:€\s*)?(\d{1,3}(?:[., ]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR|Euro)?(?![\d.,])",
+        text, re.IGNORECASE,
+    )
     if not match:
         return None
-    raw = match.group(1)
-    if "," in raw:
-        raw = raw.replace(".", "").replace(",", ".")
-    return float(raw)
+    raw = match.group(1).replace(" ", "")
+    if "." in raw and "," in raw:
+        # Last separator marks cents; earlier separators are thousands.
+        decimal_sep = "." if raw.rfind(".") > raw.rfind(",") else ","
+        other_sep = "," if decimal_sep == "." else "."
+        raw = raw.replace(other_sep, "").replace(decimal_sep, ".")
+    elif re.fullmatch(r"\d{1,3}(?:[., ]\d{3})+", raw):
+        raw = raw.replace(".", "").replace(",", "")
+    else:
+        raw = raw.replace(",", ".")
+    try:
+        amount = float(raw)
+        return amount if amount >= 0 else None
+    except ValueError:
+        return None
+
+
+def explicit_listing_price(soup):
+    """Look for the ad's dedicated price field, not arbitrary € on the page.
+
+    Ignore collateral, other suggested ads and full-page body text.
+    Missing/conflicting data is treated as unavailable rather than cheap.
+    """
+    selectors = (
+        "#viewad-price",
+        ".boxedarticle--price",
+        "[itemprop='price']",
+        "meta[property='product:price:amount']",
+        "meta[property='og:price:amount']",
+    )
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if node is not None:
+            value = node.get("content") or node.get_text(" ", strip=True)
+            amount = rent_euros(value)
+            if amount is not None:
+                return amount
+    # No trustworthy primary rent field found.
+    return None
 
 
 def in_budget(item):
@@ -431,14 +478,17 @@ def _wg_html_fallback(cat_id: int, cat_name: str, headers: dict) -> list:
 def scrape_kleinanzeigen_details(url: str) -> dict:
     details = {"price": None, "size": None, "rooms": None}
     try:
-        headers  = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        full_text = BeautifulSoup(response.text, "html.parser").get_text(" ")
+        soup = BeautifulSoup(response.text, "html.parser")
+        full_text = soup.get_text(" ", strip=True)
 
-        price_match = re.search(r"(\d{2,4}(?:[.,]\d{1,2})?)\s*€", full_text)
-        if price_match:
-            details["price"] = f"{price_match.group(1)} €/Monat"
+        # Never use the FIRST euro amount from the entire page. That might be
+        # a deposit, a recommended listing, or a price such as 1.400 €.
+        rent = explicit_listing_price(soup)
+        if rent is not None:
+            details["price"] = f"{rent:g} €/Monat"
 
         size_match = re.search(r"(\d+[\.,]?\d*)\s*m²", full_text)
         if size_match:
@@ -470,13 +520,18 @@ def _scrape_kleinanzeigen_url(url: str, category: str) -> list:
             title = " ".join(a.get_text(" ", strip=True).split())
             if not title or len(title) < 5:
                 continue
+            card = a.find_parent("article")
+            price_node = card.select_one(
+                ".aditem-main--middle--price-shipping--price"
+            ) if card else None
+            card_price = rent_euros(price_node.get_text(" ", strip=True)) if price_node else None
             listings.append({
                 "id":       f"ka::{full_link}",
                 "title":    title,
                 "link":     full_link,
                 "source":   "Kleinanzeigen",
                 "category": category,
-                "details":  {},
+                "details":  {"price": f"{card_price:g} €/Monat" if card_price is not None else None},
             })
     except Exception as e:
         log.error(f"Kleinanzeigen scrape failed for {url}: {e}")
@@ -500,7 +555,15 @@ def get_kleinanzeigen_listings() -> list:
     log.info(f"Kleinanzeigen: scraping details for {len(unique)} listings...")
     for item in unique:
         try:
-            item["details"] = scrape_kleinanzeigen_details(item["link"])
+            page_details = scrape_kleinanzeigen_details(item["link"])
+            card_price = rent_euros(item["details"].get("price"))
+            page_price = rent_euros(page_details.get("price"))
+            # If prices disagree, use the HIGHER value: never alert an
+            # overpriced ad because a lower incidental price was extracted.
+            known_prices = [p for p in (card_price, page_price) if p is not None]
+            price = max(known_prices) if known_prices else None
+            page_details["price"] = f"{price:g} €/Monat" if price is not None else None
+            item["details"] = page_details
             time.sleep(1)
         except Exception as e:
             log.debug(f"Details failed for {item['title']}: {e}")
